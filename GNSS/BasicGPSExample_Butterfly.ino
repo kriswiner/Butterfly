@@ -1,4 +1,4 @@
-/* Asset tracker example, for Butterfly
+/* Basic GPS example, for Butterfly
  *  Uses the GNSS add-on with CAM M8Q found here:
  *  
  * https://www.tindie.com/products/TleraCorp/gps-add-on-for-dragonfly-and-butterfly/
