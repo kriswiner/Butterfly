@@ -1,0 +1,270 @@
+/*
+STM32L4 I2S Arduino Audio capture and FFT power spectral density calculation example sketch
+By: Greg Tomasch (https://github.com/gregtomasch)
+
+3/25/2018
+
+License: Beerware - Use this code however you'd like. If you find it useful you can buy me a beer some time.
+
+General: This sketch demonstrates I2S audio capture from the ICS43434 24bit MEMS microphone and generation of FFT power spectral density (PSD) data.
+
+Boards: Ths sketch works with Dragonfly, Butterfly and Ladybug STM32L4 MCU development boards. Simply connect one (mono) or two (stereo) ICS43434
+        microphones to the I2S port on the MCU development board.
+
+Overview: The STM32L4 I2S Arduino library captures the stereo byte stream from I2S audio devices. In the case of the ICS43434 24bit MEMS microphone,
+          the data word size is set at 32 bits and "I2S_PHILIPS_MODE" format. So a single stereo frame consists of two 32-bit PCM words or 8 bytes. 
+          The actual PCM audio data is 24 bits wide, is signed and is stored in little-endian format with 8 bits of left-justified 0 "padding".
+          The I2S data socket has an internal receive buffer of 512 bytes or 64 stereo frames. The audio data rate can be set at 8000, 11025, 12000,
+          16000, 22050, 24000, 32000, 44100, 48000, or 96000 Hz. When the I2S receive buffer is full, the I2S data callback function is invoked and the I2S 
+          byte stream data is transferred to a local I2S data buffer.
+
+          The FFT calculations are done using native DSP functions in the ARM CMSIS library. This sketch uses complex FFT (cfft) variant functions defined
+          for single-precision floating point input data. It should be noted that the CMSIS library uses its own variable type of "float32_t" for the 
+          floating point variables used in the cfft-related functions. There is no practical difference between this data type conventional and single-
+          precision float; it is just that the CMSIS DSP functions are written for this data type and function calls may experience compiler errors if the
+          "float" type is used instead. In general, the input sample size for FFT calculations must be a power of 2. For the CMSIS functions in question,
+          16, 32, 64, 128, 256, 512, 1024, 2048, or 4096 sample sizes are supported. The cfft sample size is selected by passing in a pre-defined instance
+          pointer into the "arm_cfft_f32()" function when it is called. Other inputs in the cfft function call are explained in more detail in the ARM
+          CMSIS documentation.(https://github.com/ARM-software/CMSIS/blob/master/CMSIS/DSP_Lib/Source/TransformFunctions/arm_cfft_f32.c)
+          (https://git.nakkaya.com/nakkaya/Robocup-Tigers-Mannheim/raw/57c2377030b4b4f35834366b3190d7c830a1afce/Firmware/doc/CMSIS/DSP/html/group___complex_f_f_t.html)
+          The input buffer for the cfft calculations must conform to several specific requirements:
+
+            * The data in the input buffer array must be of type float32_t
+            * The input buffer must contain the same number of samples as the defined FFT length
+            * The data samples in the input buffer are complex; that is they have a real component equal to the PCM audio data and an imaginary component equal to 0
+            * The structure of the input buffer is {PCM[0], 0, PCM[2}, 0...... PCM[FFT_LENGTH-1], 0}
+
+          The result of the cfft calculation is the complex FFT of the input data. Each cfft result data point is also complex. The actual numeric PSD amplitude
+          data is generated using the "arm_cmplx_mag_f32()" function which calculates the real magnitude of each complex result. The final PSD amplitude data 
+          set is stored in a float32_t array of dimension equal to the FFT length. Finally, the plottable PSD is an array of x, y data points where the x coordinate 
+          is the value of the corresponding frequency bin (Audio Data rate divided by the FFT size) and the y coordinate is the PSD amplitude calculated by the cfft
+          function.
+
+          This sketch also supports averaging of multiple cfft iterations before reporting the PSD result. The basic rate of PSD data generation is defined by the
+          audio data rate and the FFT length. Depending upon the quality of the audio device generating the PCM audio data, the resulting PSD may be noisy. The user
+          can select that N PSD specta be averaged before reporting. An averaging data array is defined in the sketch. Every time the cfft function is called, the results
+          are added term-by-term to this array. When the Nth result is added to the array, each term is divided by N and the PSD results are reported over serial
+
+          Operation of the sketch is a follows:
+
+            * The USB serial port is opened
+            * The I2S port is instantiated/configured and the data callback function is attached
+            * The CMSIS cfft instance pointer is defined
+            * Every time the I2S data buffer fills (512 bytes), an interrupt is generated and the I2S data bytes are written to a local buffer array
+            * When the local I2S data buffer has a full FFT sample's-worth of data the cfft input buffer is constructed:
+              - The data in the local I2S data buffer is copied to a shadow buffer so that the I2S socket can continue to write new data in parallel while the FFT 
+                calculations are done
+              - Each 32-bit I2S data sample is converted to signed float32_t PCM data for each stereo channel
+              - The PCM data for the left and right stereo channels are averaged
+              - The float32_t complex input buffer is constructed and the cfft calculations are performed
+            * The PSD amplitude data is summed term-by-term to the existing values in the PSD averaging array
+            * When the defined number of FFT iterations have been performed and the results summed in the PSD averaging array, the frequency bin and average PSD amplitude
+              data are calculated and output over serial
+
+Features: The user can define the audio data rate, FFT length and number of cfft iterations to be averaged for each PSD data update
+
+*/
+
+#include <arm_const_structs.h>
+#include <I2S.h>
+
+#define FFT_LENGTH           256                                                                     // FFT length must be a power of 2! Allowed values are: 16, 32, 64, 128, 256, 512, 1024, 2048, or 4096
+#define SCAN_AVG_COUNT       1                                                                        // Number of FFT "Scans" to average per PSD report
+#define AUDIO_RATE           8000                                                                      // Audio data rate; supported values are: 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, or 96000
+
+uint8_t                      i2s_data[8*FFT_LENGTH];                                                   // I2S data buffer; is populated by the I2S callback function. 8 bytes per stereo frame so dimension is 8*FFT_Length
+uint8_t                      i2s_data_xfer[8*FFT_LENGTH];                                              // I2S data shadow buffer; when a full FFT sample is available, the data is copied to this buffer for FFT processing
+float32_t                    i2s_fft_buffer[2*FFT_LENGTH];                                             // Complex input buffer
+float32_t                    fft_output_buffer[FFT_LENGTH];                                            // Real magnitude output buffer
+float32_t                    psd_f32[FFT_LENGTH];                                                      // Scan-averaged complex magnitude PSD output buffer
+const arm_cfft_instance_f32* fft_Instance;                                                             // CMSIS f32 CFFT instance pointer for the selected FFT length
+const float                  freq_bin_width   = (float)AUDIO_RATE/(float)FFT_LENGTH;                   // FFT Frequency bin width in Hz
+volatile uint32_t            i2s_write        = 0;                                                     // Write index for the i2s_data[] I2S byte data buffer
+volatile uint8_t             fft_data_ready   = 0;                                                     // Fla
+uint8_t                      psd_avg_count    = 0;                                                     // FFT scan counter for scan averaging
+uint32_t                     m_ifft_flag      = 0;                                                     // Flag that selects forward (0) or inverse (1) CFFT transform.
+uint32_t                     m_do_bit_reverse = 1;                                                     // Flag that enables (1) or disables (0) bit reversal of output. Bit reversal true i normal
+
+/*************************************************************************************************/
+/*************                                                                     ***************/
+/*************                      Function Declarations                          ***************/
+/*************                                                                     ***************/
+/*************************************************************************************************/
+void     myOnReceiveCallback();
+void     fft_process(float32_t * p_input, const arm_cfft_instance_f32 * p_input_struct,
+                     float32_t * p_output, uint16_t output_size);
+int32_t  PCM_bytes_to_int32_t(uint8_t * temp);
+
+void setup()
+{
+  Serial.begin(115200);
+  while (!Serial)
+  delay(5000);
+  if (!I2S.begin(I2S_PHILIPS_MODE, AUDIO_RATE, 32))                                                    // Instantiate the I2S data socket in "I2S_PHILIPS_MODE" at AUDIO_RATE with 32-bits per sample
+  {
+    Serial.println("Failed to initialize I2S!");
+    while (1);                                                                                         // Do nothing if I2S initialize fails
+  }
+  I2S.onReceive(myOnReceiveCallback);                                                                  // Attach the I2S data receive callback function. Will be called when the I2S socket 512 bytes
+  Serial.println("I2S initialized!");
+  for(uint32_t i=0; i<FFT_LENGTH; i++)                                                                 // Initialize the PSD averaging array elements to 0.0f
+  {
+    psd_f32[i] = 0.0f;
+  }
+  switch(FFT_LENGTH)                                                                                   // Define the appropriate CMSIS f32 CFFT instance pointer for the defined FFT length
+  {
+    case 16:
+      fft_Instance = &arm_cfft_sR_f32_len16;
+      break;
+    case 32:
+      fft_Instance = &arm_cfft_sR_f32_len32;
+      break;
+    case 64:
+      fft_Instance = &arm_cfft_sR_f32_len64;
+      break;
+    case 128:
+      fft_Instance = &arm_cfft_sR_f32_len128;
+      break;
+    case 256:
+      fft_Instance = &arm_cfft_sR_f32_len256;
+      break;
+    case 512:
+      fft_Instance = &arm_cfft_sR_f32_len512;
+      break;
+    case 1024:
+      fft_Instance = &arm_cfft_sR_f32_len1024;
+      break;
+    case 2048:
+      fft_Instance = &arm_cfft_sR_f32_len2048;
+      break;
+    case 4096:
+      fft_Instance = &arm_cfft_sR_f32_len4096;
+      break;
+    default:
+      Serial.println("Incorrect FFT length specified!");
+      while(1) {;}
+      break;
+  }
+  memset(i2s_data, 0xCC, sizeof(i2s_data));                                                            // Initialize I2S byte data buffer (Decimal 204)
+  I2S.available();                                                                                     // Yes, this is necessary to activate the interrupt-driven data callback... Don't ask.
+}
+
+void loop()
+{
+  int32_t channel[2];
+
+  // Check if there is a complete data sample for FFT analysis
+  if(fft_data_ready)                                                                                   // If the I2S byte buffer has a full FFT sample in it, build the FFT input buffer and calculate the FFT
+  {
+    fft_data_ready = 0;                                                                                // Reset the FFT data ready flag
+    for(uint32_t i=0; i<FFT_LENGTH; i++)                                                               // Build the FFT complex data input buffer
+    {
+      channel[0]                = PCM_bytes_to_int32_t(&i2s_data_xfer[8*i]);                           // Assemble stereo channel 1 bytes to int32_t
+      channel[1]                = PCM_bytes_to_int32_t(&i2s_data_xfer[(8*i) + 4]);                     // Assemble stereo channel 2 bytes to int32_t
+      i2s_fft_buffer[2*i]       = ((float32_t)channel[0] + (float32_t)channel[1])/2000.0f;             // Average the two channels to handle stereo; divide by 1000 to roughly normalize the PCM data to unity
+      i2s_fft_buffer[(2*i) + 1] = 0.0f;                                                                // Set imaginary component of each sample to 0
+    }
+    fft_process(i2s_fft_buffer, fft_Instance, fft_output_buffer, FFT_LENGTH);                          // Calculate the PSD!
+    for(uint32_t i=0; i<FFT_LENGTH/2; i++)                                                             // Add new PSD values to the avrages array element-by-element
+    {
+      psd_f32[i] += fft_output_buffer[i];
+    }
+    psd_avg_count++;                                                                                   // Increment the scan averaging counter
+  }
+
+
+    // Normalize audio spectrum
+    uint32_t maxSpectrum = 1;
+    for(uint32_t i=0; i<FFT_LENGTH/2; i++)   {                                                         // The number of PSD bins is half the FFT length
+    if(psd_f32[i] > maxSpectrum) maxSpectrum = psd_f32[i];                                             // Find the maximum of the amplitude
+    }
+
+
+  // Check if the defined number of FFT calculations have been averaged
+  if(psd_avg_count >= SCAN_AVG_COUNT)                                                                  // If the requested number of PSD samples have been summed, calculate averages and report the PSD over serial
+  {
+    psd_avg_count = 0;                                                                                 // Reset the scan averaging counter flag
+    for(uint32_t i=0; i<FFT_LENGTH/2; i++)                                                             // The number of PSD bins is half the FFT length
+    {
+      psd_f32[i] /= (float)SCAN_AVG_COUNT;                                                             // Divide PSD sum arrray element by the number of scans
+      psd_f32[i] *= 2.0f;                                                                              // Multiply by 2; symmetrical about the Nyquist frequency
+      Serial.print((float)i*freq_bin_width + freq_bin_width/2.0f);                                     // Calculate the center frequency of each PSD bin
+//      Serial.print(","); Serial.println(psd_f32[i]);
+      Serial.print(","); Serial.println(psd_f32[i]/(2*maxSpectrum));                                   // Normalize spectrum
+     psd_f32[i] = 0.0f;                                                                                // Clear PSD sum array element after you print it so the psd_f32[] will be cleared and ready for the next sample
+    }
+    Serial.println("");
+  }
+}
+
+/*************************************************************************************************/
+/*************                                                                     ***************/
+/*************                            Functions                                ***************/
+/*************                                                                     ***************/
+/*************************************************************************************************/
+
+/**
+* @fn: myOnReceiveCallback()
+*
+* @brief: I2S data callback function. Is called when 512 I2S data bytes are received
+* @params:
+* @returns:
+*/
+void myOnReceiveCallback()                                                                             // I2S data ready interrupt callback function
+{
+  uint32_t count, size;
+
+  size = I2S.available();                                                                              // This callback function is called when the 512byte I2S buffer is full
+  count = size;                                                                                        // count/size should equal the I2S byte buffer size (512 bytes)
+  if((i2s_write + count) <= sizeof(i2s_data))
+  {
+    I2S.read(&i2s_data[i2s_write], count);
+    i2s_write += count;
+    
+    if(i2s_write == sizeof(i2s_data))                                                                  // The i2s_data[] bufer is a power of 2 in size so it is also a multiple of the 512-byte I2S library data buffer
+    {
+      memcpy(i2s_data_xfer, i2s_data, sizeof(i2s_data));                                               // Copy the I2S byte stream buffer to a shadow buffer so the CFFT input will not change during FFT processing
+      i2s_write      = 0;                                                                              // Reset the I2S byte stream buffer index
+      fft_data_ready = 1;                                                                              // Set the FFT data ready flag to trigger FFT calculation in the main loop
+    } 
+  } else
+  {
+    // i2s_write should never be greater than sizeof(i2s_data) so we should never get here... Future error handler just in case?
+  }
+}
+
+/**
+* @fn: fft_process(float32_t * p_input, const arm_cfft_instance_f32 * p_input_struct, float32_t * p_output, uint16_t output_size)
+*
+* @brief: CMSIS Complex FFT evaluation function
+* @params: Input data buffer pointer, arm_cfft_instance_f32 instance pointer,
+*          output buffer pointer, output data buffer size
+* @returns:
+*/
+void fft_process(float32_t * p_input, const arm_cfft_instance_f32 * p_input_struct,                    // Calculate complex FFT and complex magnitude using sp float CMSIS DSP library calls
+                 float32_t * p_output, uint16_t output_size)
+{
+    arm_cfft_f32(p_input_struct, p_input, m_ifft_flag, m_do_bit_reverse);                              // Use 32bit float CFFT module to process the data
+    arm_cmplx_mag_f32(p_input, p_output, output_size);                                                 // Calculate the magnitude at each bin using Complex Magnitude Module function
+}
+
+/**
+* @fn: PCM_bytes_to_int32_t(uint8_t * temp)
+*
+* @brief: Converts 24-bit little-endian I2S data from ICS43434 mics to signed 32-bit PCM data
+* @params: Pointer to 4-byte I2S little-endian data sequence
+* @returns: Signed 32-bit PCM audio data point
+*/
+int32_t PCM_bytes_to_int32_t(uint8_t * temp)                                                           // Function to assemble an int32_t PCM integer from the I2S byte stream
+{
+  uint32_t comp[4], result;
+
+  comp[0] = (uint32_t)temp[0];                                                                         // Data is 24bit Little Endian left-padded to 32bit; First byte = "LSB" = padding = 0
+  comp[1] = (uint32_t)temp[1];
+  comp[2] = (uint32_t)temp[2];
+  comp[3] = (uint32_t)temp[3];
+  result += comp[3]<<24;                                                                               // The Fourth byte is the MSB; shift left 24 bits
+  result += comp[2]<<16;
+  result += comp[1]<<8;                                                                                // The second byte is the LSB; shift left 8 bits because the sum will be cast as a 32bit signed integer
+  return ((int32_t)result)/256;                                                                        // Casting a 24bit integer into signed a 32bit leaves eight trailing zeros; divide by 256
+}
